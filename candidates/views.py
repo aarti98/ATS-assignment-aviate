@@ -2,8 +2,7 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Q
-from django.core.exceptions import ValidationError
+from django.db.models import Q, Case, When, IntegerField, Value
 from .models import Candidate
 from .serializers import (
     CandidateCreateSerializer, 
@@ -55,57 +54,61 @@ class CandidateViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def search(self, request):
-        query = request.query_params.get('query', '')
+        query = request.query_params.get('query', '').strip()
         if not query:
             return Response({'message': 'Search query is required'}, status=400)
 
-        # Split query into words and convert to lowercase
         query_words = [word.lower() for word in query.split()]
-        
-        # Get candidates matching any of the query words
+        query_length = len(query_words)
+
+        # Filtering candidates based on query words
         candidates = self.queryset.filter(
-            Q(name__icontains=query_words[0]) |  # First word
-            Q(name__icontains=query_words[-1]) |  # Last word
-            Q(name__icontains=query_words[1]) if len(query_words) > 2 else Q()  # Middle word if exists
+            Q(name__icontains=query_words[0]) |
+            Q(name__icontains=query_words[-1]) |
+            (Q(name__icontains=query_words[1]) if query_length > 2 else Q())
         )
 
-        # Calculate scores for each candidate
-        results = []
-        for candidate in candidates:
-            name_words = candidate.name.lower().split()
-            
-            # Calculate match criteria
-            match_count = sum(1 for word in query_words if word in name_words)
-            exact_match = all(word in name_words for word in query_words)
-            word_order_score = sum(name_words.index(word) for word in query_words if word in name_words)
-            last_name_match = query_words[-1] in name_words[-1]
-            first_name_match = query_words[0] in name_words[0]
-            
-            results.append({
-                'candidate': candidate,
-                'exact_match': exact_match,
-                'match_count': match_count,
-                'last_name_match': last_name_match,
-                'first_name_match': first_name_match,
-                'word_order_score': word_order_score
-            })
+        # Explicit combination scoring logic
+        candidates = candidates.annotate(
+            full_match=Case(
+                When(name__iexact=query, then=Value(6)),  # Highest score for exact match
+                default=Value(0),
+                output_field=IntegerField()
+            ),
+            # Explicit two-word combination scoring
+            two_word_combo=Case(
+                When(name__icontains=' '.join(query_words[:2]), then=Value(5)), 
+                When(name__icontains=' '.join([query_words[0], query_words[-1]]), then=Value(4)),
+                When(name__icontains=' '.join(query_words[-2:]), then=Value(3)), 
+                default=Value(0),
+                output_field=IntegerField()
+            ),
+            # Last name match
+            last_name_match=Case(
+                When(name__iendswith=query_words[-1], then=Value(2)),
+                default=Value(0),
+                output_field=IntegerField()
+            ),
+            # First name match
+            first_name_match=Case(
+                When(name__istartswith=query_words[0], then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField()
+            )
+        )
 
-        # Sort results by:
-        # 1. Exact match (True first)
-        # 2. Match count (descending)
-        # 3. Last name match (True first)
-        # 4. First name match (True first)
-        # 5. Word order score (lower first)
-        # 6. Alphabetical order
-        results.sort(key=lambda x: (
-            -x['exact_match'],  # True first
-            -x['match_count'],  # Higher count first
-            -x['last_name_match'],  # True first
-            -x['first_name_match'],  # True first
-            x['word_order_score'],  # Lower score first
-            x['candidate'].name  # Alphabetical order
-        ))
-
-        # Return serialized results
-        serializer = self.get_serializer([r['candidate'] for r in results], many=True)
+        # Sorting by:
+        # 1. Full match
+        # 2. Two-word combination matches (explicit order)
+        # 3. Last name match
+        # 4. First name match
+        # 5. Alphabetical order
+        candidates = candidates.order_by(
+            '-full_match',
+            '-two_word_combo',
+            '-last_name_match',
+            '-first_name_match',
+            'name'
+        )
+        serializer = self.get_serializer(candidates, many=True)
         return Response(serializer.data)
